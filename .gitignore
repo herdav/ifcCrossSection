@@ -1,0 +1,55 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# --- .NET / Visual Studio ---
+bin/
+obj/
+.vs/
+*.user
+*.suo
+
+# --- Werkzeuge für Agenten und Assistenten ---
+# Arbeitsanweisungen und Sitzungsdaten, kein Projektinhalt.
+.claude/
+CLAUDE.md
+CONTEXT.md
+**/.github/copilot-instructions.md
+
+# --- Entwicklungsumgebungen ---
+.vscode/
+.idea/
+.github/
+
+# --- Lokale Hilfsskripte, kein Projektinhalt ---
+helpers/
+
+# --- Geheimnisse und Zugangsdaten ---
+.env
+.env.*
+*.key
+*.pem
+
+# --- Projektdaten ---
+data/
+output/
+notes.txt
+*.svg
+*.xlsx
+*.ifc
+*.gsproj
+*.dxf
+
+# --- Logs und temporäre Dateien ---
+*.log
+*.tmp
+*.bak
+
+# --- Betriebssystem ---
+.DS_Store
+Thumbs.db
+desktop.ini
