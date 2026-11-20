@@ -61,10 +61,10 @@ def project_status(el):
     return str(value or "Unbekannt")
 
 
-def clean_mesh(verts, faces):
-    """Doppelte Punkte (z. B. an Kachelgrenzen) verschweissen und Dreiecke ohne Fläche
+def clean_mesh(verts, faces, decimals=4):
+    """Doppelte Punkte (z. B. an Kachelgrenzen) auf 10^-decimals m verschweissen und Dreiecke ohne Fläche
     entfernen, damit die Schnittlinien sauber durchlaufen."""
-    verts, inverse = np.unique(np.round(verts, 4), axis=0, return_inverse=True)
+    verts, inverse = np.unique(np.round(verts, decimals), axis=0, return_inverse=True)
     faces = inverse.reshape(-1)[faces]
     a, b, c = (verts[faces[:, k]] for k in range(3))
     return verts, faces[np.linalg.norm(np.cross(b - a, c - a), axis=1) > 1e-8]

@@ -5,9 +5,11 @@ import pyvista as pv
 from PySide6.QtWidgets import QVBoxLayout, QWidget
 from pyvistaqt import QtInteractor
 
-from core.config import MAST_OVERHANG
+from core.config import MAST_OVERHANG, RAIL_LAYER
 
-from .theme import ACTIVE_COLOR, BG, MAST_COLOR, OTHER_COLOR, TERRAIN_COLORS, TRACE_COLOR, ZERO_COLOR
+from .theme import (
+    ACTIVE_COLOR, BG, BREAKLINE_COLOR, MAST_COLOR, OTHER_COLOR, RAIL_COLOR, TERRAIN_COLORS, TRACE_COLOR, ZERO_COLOR,
+)
 
 TRACE_LIFT = 0.15  # m, Schnittspuren knapp über dem Gelände zeichnen
 
@@ -25,7 +27,7 @@ def polyline_mesh(point_arrays):
 class TerrainView(QWidget):
     """3D-Vorschau: Gelände je Status, Schnittspuren aller QP, aktiver QP mit Schnittebene."""
 
-    ACTIVE_ACTORS = ("active_plane", "active_lines", "active_masts", "active_labels", "active_zero")
+    ACTIVE_ACTORS = ("active_plane", "active_lines", "active_masts", "active_labels", "active_zero", "active_marks")
 
     def __init__(self):
         super().__init__()
@@ -34,11 +36,17 @@ class TerrainView(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.plotter.interactor)
         self.plotter.set_background(BG)
-        self.plotter.add_axes(color="white")
+        # Achsenkreuz mit schlanken Pfeilspitzen; die Standardkegel wirken klein dargestellt wie Kugeln
+        axes = self.plotter.add_axes(color="white", cone_radius=0.22, tip_length=0.32, shaft_length=0.68,
+                                     viewport=(0, 0, 0.16, 0.22))
+        axes.SetShaftTypeToCylinder()
+        axes.SetCylinderRadius(0.025)
+        axes.SetConeResolution(24)
         self.plotter.enable_anti_aliasing("fxaa")
         self.origin = np.zeros(3)
         self.exaggeration = 1.0
         self.terrain = []  # (PolyData, Punkte LV95)
+        self.breaklines = []
 
     def view(self, pts):
         """LV95 -> Anzeige: um Ursprung verschoben (Genauigkeit in VTK) und überhöht."""
@@ -56,6 +64,7 @@ class TerrainView(QWidget):
             poly = pv.PolyData(self.view(mesh.verts), faces)
             self.plotter.add_mesh(poly, color=TERRAIN_COLORS.get(mesh.status, OTHER_COLOR), name=f"terrain{i}")
             self.terrain.append((poly, mesh.verts))
+        self.set_breaklines(self.breaklines)
         self.plotter.view_isometric()
         self.plotter.reset_camera()
 
@@ -63,6 +72,17 @@ class TerrainView(QWidget):
         self.exaggeration = value
         for poly, verts in self.terrain:
             poly.points = self.view(verts)
+        self.set_breaklines(self.breaklines)
+
+    def set_breaklines(self, breaklines):
+        """Bruchkanten als Linien, Schienen in eigener Farbe."""
+        self.breaklines = breaklines
+        for name, color, wanted in (("rails", RAIL_COLOR, True), ("breaklines", BREAKLINE_COLOR, False)):
+            pts = [self.view(b.points + [0, 0, TRACE_LIFT]) for b in breaklines if (b.code == RAIL_LAYER) == wanted]
+            if pts:
+                self.plotter.add_mesh(polyline_mesh(pts), color=color, line_width=1, lighting=False, name=name)
+            else:
+                self.plotter.remove_actor(name)
 
     def set_traces(self, all_lines):
         lifted = [pts + [0, 0, TRACE_LIFT] for lines in all_lines for _, pts, _ in lines]
@@ -72,7 +92,7 @@ class TerrainView(QWidget):
         else:
             self.plotter.remove_actor("traces")
 
-    def set_active(self, sec, lines):
+    def set_active(self, sec, lines, marks=()):
         if sec is None or sec.length == 0:
             for name in self.ACTIVE_ACTORS:
                 self.plotter.remove_actor(name)
@@ -90,10 +110,20 @@ class TerrainView(QWidget):
                                   lighting=False, name="active_lines")
         else:
             self.plotter.remove_actor("active_lines")
-        masts = [np.array([[*p, z0], [*p, z1]]) for p in (sec.start, sec.end)]
-        self.plotter.add_mesh(polyline_mesh([self.view(m) for m in masts]), color=MAST_COLOR,
-                              line_width=3, lighting=False, name="active_masts")
-        label_points, labels = [[*sec.start, z1], [*sec.end, z1], [*a, z1]], [*sec.masts, sec.title]
+        points = sec.mast_points()
+        if points:
+            masts = [np.array([[*p, z0], [*p, z1]]) for *_, p, _ in points]
+            self.plotter.add_mesh(polyline_mesh([self.view(m) for m in masts]), color=MAST_COLOR,
+                                  line_width=3, lighting=False, name="active_masts")
+        else:
+            self.plotter.remove_actor("active_masts")
+        if len(marks):
+            self.plotter.add_mesh(pv.PolyData(self.view(np.array([p for _, p, _ in marks]))), color=RAIL_COLOR,
+                                  point_size=9, render_points_as_spheres=True, lighting=False, name="active_marks")
+        else:
+            self.plotter.remove_actor("active_marks")
+        label_points = [[*p, z1] for *_, p, _ in points] + [[*a, z1]]
+        labels = [label for _, _, label, _, _ in points] + [sec.title]
         if sec.zero_point is not None:
             self.plotter.add_mesh(pv.PolyData(self.view(sec.zero_point[None, :])), color=ZERO_COLOR, point_size=14,
                                   render_points_as_spheres=True, lighting=False, name="active_zero")

@@ -11,20 +11,28 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
-from core.config import DATA_DIR, REF_LV95, REF_NP
-from core.cutting import section_lines
+from core.checks import check_sections, terrain_warnings
+from core.config import (
+    DATA_DIR, GRID_BUFFER, GRID_UNLIMITED_HALF_LENGTH, REF_LV95, REF_NP, ZH_NONE, ZH_RAILS, ZH_TABLE,
+)
+from core.cutting import section_lines, section_marks, station_range
 from core.dxf_writer import export_sections
 from core.excel_reader import read_sections
-from core.model import Section
+from core.grid_reader import grid_patches, section_bbox
+from core.model import Breakline, CutSettings, Grid, Mesh, Section
 from core.project import PROJECT_SUFFIX, Project
+from core.terrain import TERRAIN_SUFFIXES, describe
 
 from .profile_view import ProfileView
 from .section_table import SectionModel
 from .terrain_view import TerrainView
-from .workers import MeshLoader
+from .workers import TerrainLoader
 
 APP_NAME = "Geländeschnitte"
 PROJECT_FILTER = f"Geländeschnitt-Projekt (*{PROJECT_SUFFIX})"
+TERRAIN_FILTER = ("Gelände (" + " ".join(f"*{s}" for s in TERRAIN_SUFFIXES) + ");;IFC (*.ifc);;LandXML (*.xml);;"
+                  "Raster XYZ (*.xyz *.zip);;Bruchkanten DXF (*.dxf)")
+GRID_VIEW_MARGIN = 10.0  # m, Raster in der 3D-Ansicht so weit um die Schnittlinien
 
 
 class MainWindow(QMainWindow):
@@ -32,8 +40,8 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.resize(1600, 950)
         self.project = Project()  # Pfade und Exportordner; Schnitte, Bezug usw. leben in den Widgets
-        self.meshes = []
-        self.lines_cache = {}
+        self.terrain = []  # Mesh, Grid, Breakline
+        self.cut_cache = {}
         self.loader = None
         self.dirty = False
 
@@ -67,7 +75,7 @@ class MainWindow(QMainWindow):
                 act.setToolTip(f"{text} ({QKeySequence(shortcut).toString()})")
             tb.addAction(act)
 
-        action("IFC laden…", self.load_ifc_dialog, "Ctrl+I")
+        action("Gelände laden…", self.load_terrain_dialog, "Ctrl+I")
         action("Excel laden…", self.load_excel_dialog, "Ctrl+L")
         tb.addSeparator()
         action("Projekt öffnen…", self.open_project_dialog, QKeySequence.Open)
@@ -79,8 +87,27 @@ class MainWindow(QMainWindow):
         self.reference_box.addItem("LV95 (2D + 3D)", REF_LV95)
         self.reference_box.addItem("NP = 0,0 (nur 2D)", REF_NP)
         self.reference_box.setToolTip("Bezug für Export und Querprofil")
-        self.reference_box.currentIndexChanged.connect(self.on_reference)
+        self.reference_box.currentIndexChanged.connect(self.on_settings)
         tb.addWidget(self.reference_box)
+        tb.addWidget(QLabel(" NP-Höhe "))
+        self.zero_height_box = QComboBox()
+        self.zero_height_box.addItem("Kote Tabelle", ZH_TABLE)
+        self.zero_height_box.addItem("bestehende SOK", ZH_RAILS)
+        self.zero_height_box.addItem("keine (m ü. M.)", ZH_NONE)
+        self.zero_height_box.setToolTip("Höhe des NP im Bezug NP: Kote aus der Tabelle (Fundamentliste: neue SOK), "
+                                        "Mittel der gemessenen Schienen am NP oder keine Verschiebung")
+        self.zero_height_box.currentIndexChanged.connect(self.on_settings)
+        tb.addWidget(self.zero_height_box)
+        tb.addWidget(QLabel(" Schnitt ± "))
+        self.half_length = QDoubleSpinBox()
+        self.half_length.setRange(0.0, 1000.0)
+        self.half_length.setSingleStep(5.0)
+        self.half_length.setDecimals(1)
+        self.half_length.setSuffix(" m")
+        self.half_length.setSpecialValueText("ganz")
+        self.half_length.setToolTip("Schnitt beidseits des NP begrenzen (ohne NP: der Mitte). 0 = ganzes Gelände")
+        self.half_length.valueChanged.connect(self.on_half_length)
+        tb.addWidget(self.half_length)
         action("Exportordner…", self.choose_out_dir)
         action("Export alle QP", self.export_all, "Ctrl+E")
         action("Export aktueller QP", self.export_current, "Ctrl+Shift+E")
@@ -191,17 +218,27 @@ class MainWindow(QMainWindow):
         self.table.scrollTo(index)
         self.show_section()
 
+    def settings(self):
+        return CutSettings(self.half_length.value() or None, self.zero_height_box.currentData())
+
+    def cut_for(self, sec):
+        """(Geländelinien, Marken) eines QP, zwischengespeichert."""
+        settings = self.settings()
+        # NP verschiebt die Schnittlinie, die Schnittlänge hängt am NP
+        key = (sec.start.tobytes(), sec.end.tobytes(), sec.offset, sec.centre_station, settings.half_length)
+        if key not in self.cut_cache:
+            self.cut_cache[key] = (section_lines(sec, self.terrain, settings),
+                                   section_marks(sec, self.terrain, settings))
+        return self.cut_cache[key]
+
     def lines_for(self, sec):
-        key = (sec.start.tobytes(), sec.end.tobytes(), sec.offset)  # NP verschiebt die Schnittlinie
-        if key not in self.lines_cache:
-            self.lines_cache[key] = section_lines(sec, self.meshes)
-        return self.lines_cache[key]
+        return self.cut_for(sec)[0]
 
     def show_section(self, focus=True):
         sec = self.current_section()
-        lines = self.lines_for(sec) if sec else []
-        self.profile_view.set_profile(sec, lines, self.reference())
-        self.terrain_view.set_active(sec, lines)
+        lines, marks = self.cut_for(sec) if sec else ([], [])
+        self.profile_view.set_profile(sec, lines, self.reference(), self.settings(), marks)
+        self.terrain_view.set_active(sec, lines, marks)
         if sec and focus and self.follow.isChecked():
             self.terrain_view.focus(sec, lines)
         row, count = self.current_row(), len(self.model.sections)
@@ -210,7 +247,20 @@ class MainWindow(QMainWindow):
         self.next_button.setEnabled(0 <= row < count - 1)
 
     def refresh_traces(self):
-        self.terrain_view.set_traces([self.lines_for(sec) for sec in self.model.sections])
+        """Schnittspuren aller QP und Prüfung der Koten gegen das Gelände."""
+        all_lines = []
+        for sec in self.model.sections:
+            lines = self.lines_for(sec)
+            sec.terrain_warnings = terrain_warnings(sec, lines)
+            all_lines.append(lines)
+        self.terrain_view.set_traces(all_lines)
+        self.model.refresh()
+
+    def recheck(self):
+        """Prüfungen der Tabelle neu (z. B. nach einer Korrektur); liefert die Meldungen."""
+        messages = check_sections(self.model.sections)
+        self.model.refresh()
+        return messages
 
     def step(self, delta):
         self.select_row(self.current_row() + delta)
@@ -219,6 +269,7 @@ class MainWindow(QMainWindow):
 
     def on_section_edited(self, row):
         self.set_dirty()
+        self.recheck()
         self.refresh_traces()
         if row == self.current_row():
             self.show_section(focus=False)
@@ -226,8 +277,13 @@ class MainWindow(QMainWindow):
     def reference(self):
         return self.reference_box.currentData()
 
-    def on_reference(self):
+    def on_settings(self):
         self.set_dirty()
+        self.show_section(focus=False)
+
+    def on_half_length(self):
+        self.set_dirty()
+        self.refresh_traces()
         self.show_section(focus=False)
 
     def on_exaggeration(self, value):
@@ -260,6 +316,7 @@ class MainWindow(QMainWindow):
         row = self.current_row()
         self.model.remove(row)
         self.set_dirty()
+        self.recheck()
         self.refresh_traces()
         self.select_row(row)
         self.log_msg(f"{sec.title} gelöscht")
@@ -267,47 +324,65 @@ class MainWindow(QMainWindow):
     # ---------------------------------------------------------------- Laden
 
     def start_dir(self):
-        for path in (self.project.path, self.project.excel_path, *self.project.ifc_paths):
+        for path in (self.project.path, self.project.excel_path, *self.project.terrain_paths):
             if path:
                 return str(Path(path).parent)
         return str(DATA_DIR)
 
-    def load_ifc_dialog(self):
-        paths, _ = QFileDialog.getOpenFileNames(self, "IFC laden", self.start_dir(), "IFC (*.ifc)")
+    def load_terrain_dialog(self):
+        paths, _ = QFileDialog.getOpenFileNames(self, "Gelände laden", self.start_dir(), TERRAIN_FILTER)
         if paths:
-            self.project.ifc_paths = [Path(p) for p in paths]
+            self.project.terrain_paths = [Path(p) for p in paths]
             self.set_dirty()
-            self.load_meshes()
+            self.load_terrain()
 
-    def load_meshes(self):
+    def load_terrain(self):
         if self.loader and self.loader.isRunning():
-            self.log_msg("IFC wird bereits geladen")
+            self.log_msg("Gelände wird bereits geladen")
             return
-        self.log_msg("Lese " + ", ".join(p.name for p in self.project.ifc_paths) + " ...")
+        self.log_msg("Lese " + ", ".join(p.name for p in self.project.terrain_paths) + " ...")
         self.progress.show()
-        self.loader = MeshLoader(self.project.ifc_paths)
-        self.loader.loaded.connect(self.on_meshes_loaded)
+        self.loader = TerrainLoader(self.project.terrain_paths)
+        self.loader.loaded.connect(self.on_terrain_loaded)
         self.loader.failed.connect(self.on_load_failed)
         self.loader.start()
 
-    def on_meshes_loaded(self, meshes):
+    def view_meshes(self):
+        """Flächen für die 3D-Ansicht; Raster nur in Streifen um die Schnittlinien."""
+        meshes = [t for t in self.terrain if isinstance(t, Mesh)]
+        for grid in (t for t in self.terrain if isinstance(t, Grid)):
+            bboxes = []
+            for sec in self.model.sections:
+                if sec.length:
+                    limits = station_range(sec, self.settings(), GRID_UNLIMITED_HALF_LENGTH)
+                    bboxes.append(section_bbox(sec.origin, sec.direction, *limits, GRID_VIEW_MARGIN + GRID_BUFFER))
+            patch = grid_patches(grid, bboxes)
+            if patch is not None:
+                meshes.append(patch)
+        return meshes
+
+    def on_terrain_loaded(self, terrain):
         self.progress.hide()
-        self.meshes = meshes
-        self.lines_cache.clear()
+        self.terrain = terrain
+        self.cut_cache.clear()
         self.terrain_view.set_exaggeration(self.exaggeration.value())
-        self.terrain_view.set_meshes(meshes)
-        triangles = f"{sum(len(m.faces) for m in meshes):,}".replace(",", "'")
-        self.log_msg(f"{len(meshes)} Geländeflächen, {triangles} Dreiecke")
+        self.terrain_view.set_meshes(self.view_meshes())
+        self.terrain_view.set_breaklines([t for t in terrain if isinstance(t, Breakline)])
+        self.log_msg(describe(terrain))
         self.refresh_traces()
+        for sec in self.model.sections:
+            for w in sec.terrain_warnings:
+                self.log_msg(f"WARNUNG {sec.title}: {w}")
         self.show_section()
 
     def on_load_failed(self, message):
         self.progress.hide()
         self.log_msg(f"FEHLER beim Laden: {message}")
-        QMessageBox.critical(self, "IFC laden", message)
+        QMessageBox.critical(self, "Gelände laden", message)
 
     def load_excel_dialog(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Excel laden", self.start_dir(), "Excel (*.xlsx)")
+        path, _ = QFileDialog.getOpenFileName(self, "Excel laden (Schnitttabelle oder Fundamentliste)",
+                                              self.start_dir(), "Excel (*.xlsx *.xlsm)")
         if not path:
             return
         if self.model.sections and QMessageBox.question(
@@ -324,6 +399,8 @@ class MainWindow(QMainWindow):
         self.model.reset(sections)
         self.log_msg(f"{len(sections)} QP aus {self.project.excel_path.name} gelesen")
         self.set_dirty()
+        if any(isinstance(t, Grid) for t in self.terrain):
+            self.terrain_view.set_meshes(self.view_meshes())
         self.refresh_traces()
         self.select_row(0)
 
@@ -349,26 +426,31 @@ class MainWindow(QMainWindow):
     def open_project(self, path):
         try:
             project = Project.load(path)
-        except (OSError, ValueError, KeyError) as exc:
+        except (OSError, ValueError, KeyError, TypeError) as exc:
             QMessageBox.critical(self, "Projekt öffnen", f"{Path(path).name} kann nicht gelesen werden:\n{exc}")
             return
 
         self.project = project
         self.model.reset(project.sections)
-        self.meshes = []
-        self.lines_cache.clear()
+        self.terrain = []
+        self.cut_cache.clear()
         self.terrain_view.set_meshes([])
+        self.terrain_view.set_breaklines([])
         self.exaggeration.setValue(project.exaggeration)
+        self.half_length.setValue(project.half_length or 0.0)
         self.reference_box.setCurrentIndex(max(self.reference_box.findData(project.reference), 0))
+        self.zero_height_box.setCurrentIndex(max(self.zero_height_box.findData(project.zero_height), 0))
         self.select_row(project.current)
         self.log_msg(f"Projekt {project.path.name} geöffnet, {len(project.sections)} QP")
+        for line in project.messages:
+            self.log_msg(line)
 
-        missing = [p for p in project.ifc_paths if not p.exists()]
+        missing = [p for p in project.terrain_paths if not p.exists()]
         for p in missing:
-            self.log_msg(f"WARNUNG IFC nicht gefunden: {p}")
-        project.ifc_paths = [p for p in project.ifc_paths if p.exists()]
-        if project.ifc_paths:
-            self.load_meshes()
+            self.log_msg(f"WARNUNG Geländedatei nicht gefunden: {p}")
+        project.terrain_paths = [p for p in project.terrain_paths if p.exists()]
+        if project.terrain_paths:
+            self.load_terrain()
         self.set_dirty(bool(missing))
 
     def save_project(self):
@@ -377,6 +459,8 @@ class MainWindow(QMainWindow):
         self.project.sections = self.model.sections
         self.project.reference = self.reference()
         self.project.exaggeration = self.exaggeration.value()
+        self.project.half_length = self.settings().half_length
+        self.project.zero_height = self.settings().zero_height
         self.project.current = self.current_row()
         try:
             self.project.save()
@@ -412,8 +496,8 @@ class MainWindow(QMainWindow):
         self.export([sec] if sec else [])
 
     def export(self, sections):
-        if not self.meshes:
-            QMessageBox.information(self, "Export", "Zuerst ein IFC laden.")
+        if not any(isinstance(t, (Mesh, Grid)) for t in self.terrain):
+            QMessageBox.information(self, "Export", "Zuerst ein Gelände laden.")
             return
         if not sections:
             return
@@ -421,7 +505,7 @@ class MainWindow(QMainWindow):
         reference = self.reference()
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            results = export_sections(sections, self.meshes, out_dir, reference)
+            results = export_sections(sections, self.terrain, out_dir, reference, self.settings())
         except OSError as exc:
             results = [f"FEHLER {exc}"]
         finally:
@@ -429,6 +513,7 @@ class MainWindow(QMainWindow):
         for line in results:
             self.log_msg(line)
         errors = sum("FEHLER" in line for line in results)
+        self.model.refresh()
         self.log_msg(f"Export Bezug {reference} nach {out_dir}: {len(sections) - errors} QP ok, {errors} Fehler")
         self.statusBar().showMessage(f"{len(sections) - errors} QP exportiert", 5000)
 

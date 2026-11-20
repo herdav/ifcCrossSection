@@ -2,6 +2,9 @@
 
 import numpy as np
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt, Signal
+from PySide6.QtGui import QColor
+
+from .theme import WARNING_COLOR
 
 COLUMNS = ("QP", "km", "Mast 1", "E 1", "N 1", "Mast 2", "E 2", "N 2", "NP E", "NP N", "NP H")
 NUMBER_COLUMNS = (1, 3, 4, 6, 7, 8, 9, 10)
@@ -44,8 +47,17 @@ class SectionModel(QAbstractTableModel):
                 sec.masts[0], f"{sec.start[0]:.3f}", f"{sec.start[1]:.3f}",
                 sec.masts[1], f"{sec.end[0]:.3f}", f"{sec.end[1]:.3f}", *zero,
             ][col]
-        if role == Qt.ToolTipRole and col in ZERO_COLUMNS:
-            return "Nullpunkt des QP (leer = kein NP). Der Schnitt wird parallel durch den NP gelegt."
+        warnings = sec.warnings + sec.terrain_warnings
+        if role == Qt.ForegroundRole and warnings:
+            return QColor(WARNING_COLOR)
+        if role == Qt.ToolTipRole:
+            tips = [f"WARNUNG {w}" for w in warnings]
+            if col in ZERO_COLUMNS:
+                tips.append("Nullpunkt des QP (leer = kein NP). Der Schnitt wird parallel durch den NP gelegt.")
+            if col in (2, 5) and sec.mast_info[col == 5]:
+                info = sec.mast_info[col == 5]
+                tips.append(f"Mast {info.label}, Gleis {info.track}, a = {info.a} m, Kote {info.kote}")
+            return "\n".join(tips) or None
         if role == Qt.TextAlignmentRole and col in NUMBER_COLUMNS:
             return int(Qt.AlignRight | Qt.AlignVCenter)
         return None
@@ -85,6 +97,11 @@ class SectionModel(QAbstractTableModel):
         self.beginResetModel()
         self.sections = sections
         self.endResetModel()
+
+    def refresh(self):
+        """Warnungen neu anzeigen."""
+        if self.sections:
+            self.dataChanged.emit(self.index(0, 0), self.index(len(self.sections) - 1, len(COLUMNS) - 1))
 
     def insert(self, row, sec):
         self.beginInsertRows(QModelIndex(), row, row)

@@ -7,10 +7,11 @@ from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import QWidget
 
-from core.config import MAST_OVERHANG, REF_LV95, REF_NP
-from core.cutting import to_profile
+from core.config import MAST_OVERHANG, RAIL_LAYER, REF_LV95, REF_NP, ZH_NONE, ZH_RAILS
+from core.cutting import reference_shift, to_profile
+from core.model import CutSettings
 
-from .theme import BG, GRID, LINE_COLORS, MAST_COLOR, OTHER_COLOR, ZERO_COLOR
+from .theme import BG, BREAKLINE_COLOR, GRID, LINE_COLORS, MAST_COLOR, OTHER_COLOR, RAIL_COLOR, ZERO_COLOR
 
 
 def nice_step(min_step):
@@ -26,7 +27,8 @@ def ticks(lo, hi, min_step):
 class ProfileView(QWidget):
     """Querprofil des aktiven QP mit Überhöhung.
 
-    Bezug LV95: x = Station ab 1. Mast, y = Höhe m ü. M.  Bezug NP: Nullpunkt auf 0,0 (wie DXF).
+    Bezug LV95: x = Station ab Punkt 1, y = Höhe m ü. M.  Bezug NP: Nullpunkt auf 0,0 (wie DXF).
+    Schienen als Dreieck, übrige Bruchkanten als Kreuz mit Code.
     """
 
     hovered = Signal(str)
@@ -37,20 +39,37 @@ class ProfileView(QWidget):
         self.setMinimumHeight(180)
         self.section = None
         self.profile = []  # (Status, Stationen, Höhen) im gewählten Bezug
+        self.marks = []  # (Code, Station, Höhe) im gewählten Bezug
         self.reference = REF_LV95
+        self.settings = CutSettings()
         self.relative = False
+        self.no_rails = False  # NP-Höhe aus den Schienen gewählt, aber keine am NP: Kote der Tabelle
+        self._shift = (0.0, 0.0)
         self.exaggeration = 1.0
         self._transform = None  # (s0, z1, kx, kz, x0, y0) für die Mausposition
 
-    def set_profile(self, section, lines, reference=REF_LV95):
+    def set_profile(self, section, lines, reference=REF_LV95, settings=None, marks=()):
         self.section = section
         self.reference = reference
+        self.settings = settings or CutSettings()
         self.relative = section is not None and reference == REF_NP and section.zero_point is not None
-        self.profile = to_profile(lines, self.shift())
+        shift = reference_shift(section, reference, self.settings, marks) if section else (0.0, 0.0)
+        self.no_rails = shift[1] is None
+        if self.no_rails:
+            shift = (shift[0], section.zero_point[2])
+        self._shift = shift
+        self.profile = to_profile(lines, shift)
+        self.marks = [(code, s - shift[0], p[2] - shift[1]) for code, p, s in marks]
         self.update()
 
     def shift(self):
-        return self.section.shift(self.reference) if self.section else (0.0, 0.0)
+        return self._shift
+
+    def zero_height(self):
+        """Höhe des NP-Kreuzes im angezeigten Bezug."""
+        if self.relative and self.settings.zero_height != ZH_NONE:
+            return 0.0
+        return self.section.zero_point[2] - self._shift[1]
 
     def set_exaggeration(self, value):
         self.exaggeration = value
@@ -67,12 +86,14 @@ class ProfileView(QWidget):
             return
 
         s_shift, z_shift = self.shift()
-        masts = [(station - s_shift, name) for station, name in zip((0.0, self.section.length), self.section.masts)]
+        masts = [(station - s_shift, label) for station, _, label, _, _ in self.section.mast_points()]
         zero = None
         if self.section.zero_point is not None:
-            zero = (self.section.zero_station - s_shift, self.section.zero_point[2] - z_shift)
-        s_all = np.concatenate([s for _, s, _ in self.profile] + [np.array([m for m, _ in masts])])
+            zero = (self.section.zero_station - s_shift, self.zero_height())
+        s_all = np.concatenate([s for _, s, _ in self.profile] + [np.array([m for m, _ in masts] or [-s_shift])])
         z_all = np.concatenate([z for *_, z in self.profile]) if self.profile else np.array([0.0])
+        if self.marks:
+            z_all = np.r_[z_all, [z for *_, z in self.marks]]
         if zero:
             s_all, z_all = np.r_[s_all, zero[0]], np.r_[z_all, zero[1]]
         s0, s1 = s_all.min(), s_all.max()
@@ -117,6 +138,21 @@ class ProfileView(QWidget):
             p.setPen(QColor(MAST_COLOR))
             p.drawText(QRectF(pt(station, z1).x() - 40, pt(station, z1).y() - 18, 80, 16), Qt.AlignCenter, name)
 
+        for code, station, height in self.marks:
+            c = pt(station, height)
+            if code == RAIL_LAYER:
+                p.setPen(QPen(QColor(RAIL_COLOR), 1.5))
+                p.drawPolygon(QPolygonF([c, c + QPointF(-5, -8), c + QPointF(5, -8)]))
+            else:
+                p.setPen(QPen(QColor(BREAKLINE_COLOR), 1.5))
+                p.drawLine(c + QPointF(-4, -4), c + QPointF(4, 4))
+                p.drawLine(c + QPointF(-4, 4), c + QPointF(4, -4))
+                p.save()
+                p.translate(c + QPointF(3, -6))
+                p.rotate(-60)
+                p.drawText(QPointF(0, 0), code)
+                p.restore()
+
         if zero:
             c = pt(*zero)
             p.setPen(QPen(QColor(ZERO_COLOR), 2))
@@ -133,12 +169,17 @@ class ProfileView(QWidget):
         font.setPointSizeF(8)
         p.setFont(font)
         p.setPen(QColor("#9a9a9a"))
-        if self.relative:
-            axes = "Bezug NP: Station ab NP [m] / Höhe ab NP [m]"
+        if self.relative and self.no_rails:
+            axes = "Bezug NP: keine Schienen am NP, Höhe ab Kote Tabelle [m]"
+        elif self.relative and self.settings.zero_height == ZH_NONE:
+            axes = "Bezug NP: Station ab NP [m] / Höhe [m ü. M.]"
+        elif self.relative:
+            height = "bestehender SOK" if self.settings.zero_height == ZH_RAILS else "NP"
+            axes = f"Bezug NP: Station ab NP [m] / Höhe ab {height} [m]"
         elif self.reference == REF_NP:
-            axes = "Kein NP, Anzeige LV95: Station ab Mast 1 [m] / Höhe [m ü. M.]"
+            axes = "Kein NP, Anzeige LV95: Station ab Punkt 1 [m] / Höhe [m ü. M.]"
         else:
-            axes = "Bezug LV95: Station ab Mast 1 [m] / Höhe [m ü. M.]"
+            axes = "Bezug LV95: Station ab Punkt 1 [m] / Höhe [m ü. M.]"
         p.drawText(QRectF(left, 6, w, 20), Qt.AlignRight | Qt.AlignVCenter,
                    f"{axes}, Überhöhung {self.exaggeration:g}x")
 
@@ -149,7 +190,7 @@ class ProfileView(QWidget):
         s = s0 + (event.position().x() - x0) / kx
         z = z1 - (event.position().y() - y0) / kz
         ground = [np.interp(s, st, hz) for _, st, hz in self.profile if st[0] <= s <= st[-1]]
-        unit = "m ab NP" if self.relative else "m ü. M."
+        unit = "m ab NP" if self.relative and self.settings.zero_height != ZH_NONE else "m ü. M."
         text = f"Station {s:.2f} m, Höhe {z:.2f} {unit}"
         if ground:
             text += f", Gelände {max(ground):.2f} {unit}"

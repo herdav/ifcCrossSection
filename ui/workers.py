@@ -2,10 +2,10 @@
 
 from PySide6.QtCore import QThread, Signal
 
-from core.ifc_reader import load_meshes
+from core.terrain import load_terrain
 
 
-class MeshLoader(QThread):
+class TerrainLoader(QThread):
     loaded = Signal(object)
     failed = Signal(str)
 
@@ -15,6 +15,6 @@ class MeshLoader(QThread):
 
     def run(self):
         try:
-            self.loaded.emit([mesh for path in self.paths for mesh in load_meshes(path)])
+            self.loaded.emit(load_terrain(self.paths))
         except Exception as exc:
             self.failed.emit(str(exc))

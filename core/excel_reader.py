@@ -1,13 +1,16 @@
 """Schnitttabelle aus Excel lesen: eine Zeile pro QP.
 
 QP | KM | Mast 1 | X1 | Y1 | Mast 2 | X2 | Y2, optional Nullpunkt X | Nullpunkt Y | Nullpunkt Z.
-X = E, Y = N (LV95).
+X = E, Y = N (LV95). Die SBB-Fundamentliste liest foundation_reader.
 """
+
+import warnings
 
 import numpy as np
 import openpyxl
 
-from .config import EXCEL_COLUMNS, EXCEL_ZERO_POINT, ZERO_POINT_NOTICE
+from .config import EXCEL_COLUMNS, EXCEL_ZERO_POINT, FOUNDATION_SHEET, ZERO_POINT_NOTICE
+from .foundation_reader import read_foundation_list
 from .model import DataError, Section
 
 
@@ -18,8 +21,16 @@ def cell_text(value):
 
 
 def read_sections(xlsx_path):
-    """Liefert (Querprofile, Meldungen). Meldungen sind WARNUNG- und HINWEIS-Zeilen."""
-    ws = openpyxl.load_workbook(xlsx_path, data_only=True).active
+    """Liefert (Querprofile, Meldungen). Meldungen sind WARNUNG- und HINWEIS-Zeilen.
+
+    Erkennt die SBB-Fundamentliste am Blatt FOUNDATION_SHEET, sonst die eigene Schnitttabelle.
+    """
+    with warnings.catch_warnings():  # Erweiterungen der Vorlage (bedingte Formatierung usw.) kennt openpyxl nicht
+        warnings.simplefilter("ignore", UserWarning)
+        wb = openpyxl.load_workbook(xlsx_path, data_only=True)
+    if FOUNDATION_SHEET in wb.sheetnames:
+        return read_foundation_list(wb[FOUNDATION_SHEET])
+    ws = wb.active
     rows = ws.iter_rows(values_only=True)
     header = [cell_text(h) if h is not None else "" for h in next(rows)]
     try:

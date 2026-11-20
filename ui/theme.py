@@ -4,13 +4,18 @@ from PySide6.QtGui import QColor, QPalette
 
 BG = "#1e1f22"
 GRID = "#383a3f"
-LINE_COLORS = {"Bestand": "#d4d4d4", "Neubau": "#ff5c5c", "Abbruch": "#ffd54f"}  # wie DXF-Layer
-TERRAIN_COLORS = {"Bestand": "#a39a8a", "Neubau": "#c0504d", "Abbruch": "#c9a227"}
+LINE_COLORS = {"Bestand": "#d4d4d4", "Neubau": "#ff5c5c", "Abbruch": "#ffd54f",  # wie DXF-Layer
+               "Aufnahme": "#d4d4d4", "swissALTI3D": "#9e9e9e"}
+TERRAIN_COLORS = {"Bestand": "#a39a8a", "Neubau": "#c0504d", "Abbruch": "#c9a227",
+                  "Aufnahme": "#a39a8a", "swissALTI3D": "#6d6a64"}
 OTHER_COLOR = "#81c784"
 MAST_COLOR = "#4fc3f7"
 TRACE_COLOR = "#6fa8dc"
 ACTIVE_COLOR = "#ffca28"
 ZERO_COLOR = "#e040fb"  # Nullpunkt, wie DXF-Layer NULLPUNKT (magenta)
+RAIL_COLOR = "#64b5f6"  # wie DXF-Layer SCHIENE (blau)
+BREAKLINE_COLOR = "#81c784"  # wie DXF-Layer BRUCHKANTE (grün)
+WARNING_COLOR = "#ff8a65"
 
 
 def apply_dark_theme(app):
